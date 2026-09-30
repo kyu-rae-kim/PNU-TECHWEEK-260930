@@ -12,10 +12,12 @@ import heapq
 import json
 import math
 import os
+from collections import deque
 
 import numpy as np
 from controller import Robot
 from motion_guard import MotionMonitor, Recovery, clearance_escape, match_scans, scan_points
+from visual_obstacles import LowObstacleMap, floor_obstacle
 
 
 def clamp(value, low, high):
@@ -210,7 +212,7 @@ class OccupancyGrid:
                 cy = sum(point[1] for point in members) / len(members)
                 gx, gy = min(members, key=lambda p: (p[0] - cx) ** 2 + (p[1] - cy) ** 2)
                 distance = math.hypot(gx - rx, gy - ry) * self.resolution
-                components.append((gx, gy, min(area, 50), distance))
+                components.append((gx, gy, min(len(members), 50), distance))
         return components
 
     def astar(self, start, goal, inflated=None, allow_unknown=False):
@@ -314,6 +316,24 @@ class OccupancyGrid:
             anchor = candidate
         return result
 
+    def exploration_regions(self, reachable):
+        """Approximate rooms by removing narrow doorways, then regrow on free cells."""
+        import cv2
+        radius = max(1, int(math.ceil(.40 / self.resolution)))
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * radius + 1, 2 * radius + 1))
+        # reachable already includes robot clearance; erosion separates doorways.
+        core = cv2.erode(reachable.astype(np.uint8), kernel)
+        _, labels = cv2.connectedComponents(core, connectivity=4)
+        ys, xs = np.nonzero(labels)
+        queue = deque(zip(xs.tolist(), ys.tolist()))
+        while queue:
+            x, y = queue.popleft()
+            for nx, ny in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
+                if self.inside(nx, ny) and reachable[ny, nx] and labels[ny, nx] == 0:
+                    labels[ny, nx] = labels[y, x]
+                    queue.append((nx, ny))
+        return labels
+
 
 class PoseEstimator:
     def __init__(self, wheel_radius=0.033, axle_length=0.160):
@@ -382,6 +402,7 @@ class PoseEstimator:
 
 
 class RedAppleDetector:
+    VISIT_DISTANCE_M = 0.80
     def __init__(self, camera):
         from ultralytics import YOLO
         import torch
@@ -402,6 +423,8 @@ class RedAppleDetector:
         self.last_inference_time = -10.0
         self.boxes = []
         self.people_boxes = []
+        self.low_observations = []
+        self.low_boxes = []
 
     def detect(self, image_bytes, pose, now):
         if now - self.last_inference_time < 0.25:
@@ -409,6 +432,8 @@ class RedAppleDetector:
         self.last_inference_time = now
         self.boxes = []
         self.people_boxes = []
+        self.low_observations = []
+        self.low_boxes = []
         if not image_bytes:
             return []
         bgra = np.frombuffer(image_bytes, np.uint8).reshape((self.height, self.width, 4))
@@ -417,7 +442,7 @@ class RedAppleDetector:
             source=bgr,
             conf=0.2,
             iou=0.45,
-            classes=[0, 39, 41, 47],  # person, bottle, cup, apple
+            classes=[0, 15, 39, 41, 47, 75],  # include vase to resolve person confusion
             imgsz=640,
             device="cpu",
             verbose=False,
@@ -425,15 +450,28 @@ class RedAppleDetector:
         candidates = []
         exclusions = []
         if result.boxes is not None:
-            for box in result.boxes:
-                coords = tuple(float(value) for value in box.xyxy[0].cpu().tolist())
-                label = int(box.cls[0].cpu())
+            detections = [(tuple(float(value) for value in box.xyxy[0].cpu().tolist()),
+                           int(box.cls[0].cpu()), float(box.conf[0].cpu()))
+                          for box in result.boxes]
+            for coords, label, confidence in detections:
                 if label == 0:
+                    # The apple threshold (.20) is too permissive for person stops.
+                    # Compare competing vessel labels before accepting a person.
+                    x1, y1, x2, y2 = coords
+                    area = max(1., (x2 - x1) * (y2 - y1))
+                    vessel = any(other_label in (39, 41, 75) and score >= confidence
+                                 and max(0., min(x2, box[2]) - max(x1, box[0])) *
+                                 max(0., min(y2, box[3]) - max(y1, box[1])) / area > .5
+                                 for box, other_label, score in detections)
+                    if confidence < .55 or vessel:
+                        continue
                     self.people_boxes.append(coords)
+                elif label != 75:
+                    self.add_low_obstacle(coords, {15: 'cat', 39: 'container', 41: 'container', 47: 'apple'}[label], pose)
                 if label != 47:
                     exclusions.append(coords)
                 else:
-                    candidates.append((*coords, float(box.conf[0].cpu()), "YOLO"))
+                    candidates.append((*coords, confidence, "YOLO"))
 
         # The 10 cm fruit can be too small for the generic COCO model at range.
         # Pure red geometry supplies proposals when YOLO misses it; these are for
@@ -448,6 +486,8 @@ class RedAppleDetector:
         count, labels, stats, _ = cv2.connectedComponentsWithStats(red_mask, 8)
         for index in range(1, count):
             x, y, width, height, area = (int(value) for value in stats[index])
+            # Color alone cannot distinguish a floor texture from a solid object.
+            # Keep inspection proposals, but only semantic detections add obstacles.
             if (area < 30 or width < 7 or height < 7 or
                     not 0.62 <= width / height <= 1.55 or
                     not 0.40 <= area / (width * height) <= 0.92):
@@ -505,6 +545,12 @@ class RedAppleDetector:
             ))
         return observations
 
+    def add_low_obstacle(self, coords, label, pose):
+        obstacle = floor_obstacle(coords, label, pose, self.focal, self.width, self.height)
+        if obstacle is not None:
+            self.low_observations.append(obstacle)
+            self.low_boxes.append((*map(int, coords), 0., label))
+
     def update_tracks(self, observations, now):
         newly_confirmed = []
         for x, y, confidence, bearing, observed_distance, cx, cy, radius, _, red_ratio, source in observations:
@@ -538,16 +584,25 @@ class RedAppleDetector:
                 "red_ratio": round(red_ratio, 3),
                 "source": source,
             }
-            if (
-                nearest["hits"] >= 3
-                and nearest["yolo_hits"] >= 3
-                and not nearest["confirmed"]
-            ):
+            if nearest['hits'] >= 3 and nearest['yolo_hits'] >= 3:
+                nearest['identified'] = True
+            if (nearest.get('identified', False) and not nearest['confirmed']
+                    and source == 'YOLO' and observed_distance <= self.VISIT_DISTANCE_M):
+                if any(math.hypot(x - old['x'], y - old['y']) < .75 for old in self.visited):
+                    nearest['duplicate'] = True
+                    continue
                 nearest["confirmed"] = True
+                nearest['visited'] = True
+                nearest['visited_at'] = now
                 newly_confirmed.append(nearest)
-        self.tracks = [track for track in self.tracks if track["confirmed"]
+        self.tracks = [track for track in self.tracks if track["confirmed"] or track.get('identified', False)
                        or now - track["last_seen"] < 4.0 or track.get('retry_after', 0) > now]
         return newly_confirmed
+
+    @property
+    def identified(self):
+        return [track for track in self.tracks if track.get('identified', track['confirmed'])
+                and not track.get('duplicate', False)]
 
     @property
     def confirmed(self):
@@ -625,11 +680,6 @@ class MissionController:
         self.camera = self.robot.getDevice("camera")
         self.camera.enable(self.timestep)
         self.apple_detector = RedAppleDetector(self.camera)
-        self.person_camera = self.robot.getDevice('camera_people')
-        if self.person_camera is not None:
-            self.person_camera.enable(self.timestep)
-        self.person_boxes = []
-        self.last_person_inference_time = -10.
         self.camera_display = self.robot.getDevice("YOLO camera")
         self.camera_display_image = None
         try:
@@ -643,6 +693,7 @@ class MissionController:
         self.path = []
         self.path_index = 0
         self.last_plan_time = -10.0
+        self.last_path_check_time = -10.0
         self.last_scan_match_time = -10.0
         self.last_display_time = -10.0
         self.last_status_time = -10.0
@@ -658,6 +709,7 @@ class MissionController:
         self.visit_counts = np.zeros_like(self.grid.log_odds, dtype=np.uint16)
         self.last_visit_time = -10.0
         self.people = PeopleTracker()
+        self.low_obstacles = LowObstacleMap()
         self.dynamic_mask = None
         self.inspection_goal = None
         self.survey_remaining = 2.0 * math.pi
@@ -683,6 +735,11 @@ class MissionController:
 
     def navigation_obstacles(self):
         inflated = self.grid.occupied_inflated()
+        if hasattr(self, 'low_obstacles'):
+            for obj in self.low_obstacles.active(self.robot.getTime()):
+                cell = self.grid.world_to_grid(obj['x'], obj['y'])
+                if self.grid.inside(*cell):
+                    draw_disc(inflated, cell, int(math.ceil((obj['radius'] + .20) / self.grid.resolution)), True)
         recovery = getattr(self, 'recovery', None)
         if recovery is None:
             return inflated
@@ -722,7 +779,9 @@ class MissionController:
     def choose_frontier_path(self, pose, now):
         start = self.grid.world_to_grid(pose[0], pose[1])
         inflated = self.navigation_obstacles()
-        candidates = self.grid.frontier_components(start)
+        seen = getattr(self, 'camera_seen', None)
+        if seen is None:
+            seen = self.visit_counts > 0
         self.rejected_frontiers = [(cell, expiry) for cell, expiry in self.rejected_frontiers
                                    if expiry > now]
         def blocked(cell):
@@ -731,47 +790,89 @@ class MissionController:
 
         if self.frontier_goal is not None and not blocked(self.frontier_goal):
             gx, gy = self.frontier_goal
-            path = self.grid.astar(start, (gx, gy), inflated)
-            if path:
-                return self.grid.smooth_path(path, inflated)
-            self.reject_frontier(now)
+            already_checked = self.visit_counts[gy, gx] > 0 and seen[gy, gx]
+            if not already_checked:
+                path = self.grid.astar(start, (gx, gy), inflated)
+                if path:
+                    return self.grid.smooth_path(path, inflated)
+                self.reject_frontier(now)
+            else:
+                self.frontier_goal = None
 
         # Prefer new space and reachable nearby boundaries. Avoid repeatedly
         # crossing the same room for a large but inaccessible frontier.
-        candidates = [item for item in candidates if not blocked(item[:2])]
-        candidates.sort(key=lambda item: (
-            0.06 * item[2] - item[3] - 0.9 * self.visit_counts[item[1], item[0]]),
-            reverse=True)
+        candidates = [item for item in self.grid.frontier_components(start)
+                      if not blocked(item[:2])]
         best = None
         costs, parents = self.grid.reachable_paths(start, inflated)
-        # A LiDAR-mapped room can still contain floor objects outside the camera
-        # view. Once geometric frontiers run out, visit reachable unseen floors.
+        reachable = np.zeros_like(inflated, dtype=bool)
+        for gx, gy in costs:
+            reachable[gy, gx] = True
+        rooms = self.grid.exploration_regions(reachable)
+        anchor = getattr(self, 'room_anchor', start)
+        active_room = int(rooms[anchor[1], anchor[0]])
+        if not active_room:
+            anchor = start
+            active_room = int(rooms[start[1], start[0]])
+        if not hasattr(self, 'room_started'):
+            self.room_started = now
+        # Do not remain indefinitely in a room whose remaining views are blocked.
+        room_priority = active_room > 0 and now - self.room_started < 120.
+        novelty_cache = {}
+        view_radius = int(1.2 / self.grid.resolution)
+        view_offsets = [(round(view_radius * math.cos(a)), round(view_radius * math.sin(a)))
+                        for a in np.linspace(-math.pi, math.pi, 32, endpoint=False)]
+        # Evaluate neighbourhoods, not a single untouched cell beside a route.
+        def novelty(gx, gy):
+            if (gx, gy) in novelty_cache:
+                return novelty_cache[(gx, gy)]
+            region = np.s_[max(0, gy - 8):min(self.grid.size, gy + 9),
+                           max(0, gx - 8):min(self.grid.size, gx + 9)]
+            free = reachable[region] & (rooms[region] == rooms[gy, gx])
+            size = max(1, int(np.count_nonzero(free)))
+            visited = float(np.count_nonzero(free & (self.visit_counts[region] > 0))) / size
+            visible_unseen = set()
+            for dx, dy in view_offsets:
+                for vx, vy in bresenham(gx, gy, gx + dx, gy + dy):
+                    if not self.grid.inside(vx, vy) or self.grid.log_odds[vy, vx] > -1:
+                        break
+                    if not seen[vy, vx] and math.hypot(vx - gx, vy - gy) * self.grid.resolution >= .20:
+                        visible_unseen.add((vx, vy))
+            unseen = len(visible_unseen)
+            novelty_cache[(gx, gy)] = (visited, unseen)
+            return visited, unseen
+        # Keep camera viewpoints alongside frontiers, including within this room.
         if hasattr(self, 'camera_seen'):
             visual_candidates = []
             for (gx, gy), distance in costs.items():
                 if gx % 8 or gy % 8 or distance < 0.4 or blocked((gx, gy)):
                     continue
-                y0, y1 = max(0, gy - 8), min(self.grid.size, gy + 9)
-                x0, x1 = max(0, gx - 8), min(self.grid.size, gx + 9)
-                unseen = (~self.camera_seen[y0:y1, x0:x1]
-                          & (self.grid.log_odds[y0:y1, x0:x1] <= self.grid.FREE_LIMIT))
-                gain = int(np.count_nonzero(unseen))
+                _, gain = novelty(gx, gy)
                 if gain >= 20:
                     visual_candidates.append((gx, gy, min(50, gain / 4), distance))
             candidates.extend(visual_candidates)
-            candidates.sort(key=lambda item: .06 * item[2] - item[3]
-                            - .9 * self.visit_counts[item[1], item[0]], reverse=True)
         for gx, gy, gain, distance in candidates:
-            if (gx, gy) in costs:
-                travel = costs[(gx, gy)]
-                score = 0.06 * gain - travel - 0.9 * self.visit_counts[gy, gx]
-                if best is None or score > best[0]:
-                    best = (score, (gx, gy), distance)
-            # The cheap score above is an upper bound (straight-line <= path cost).
-            if best is not None and 0.06 * gain - distance - 0.9 * self.visit_counts[gy, gx] < best[0]:
-                break
+            travel = costs.get((gx, gy))
+            if travel is None or travel < .4:
+                continue
+            visited, unseen = novelty(gx, gy)
+            # Unvisited areas first; then camera-unseen floors; revisit only as
+            # a fallback. Rank within each group by gain and real route cost.
+            priority = (2 if unseen >= 20 else
+                        1 if self.visit_counts[gy, gx] == 0 and visited < .25 else 0)
+            score = (.06 * gain + .015 * min(unseen, 100) - travel - 2.0 * visited
+                     - .3 * math.log1p(int(self.visit_counts[gy, gx])))
+            preferred_room = (rooms[gy, gx] == active_room if room_priority else
+                              active_room > 0 and rooms[gy, gx] != active_room)
+            rank = (int(preferred_room and priority > 0), priority, score)
+            if best is None or rank > best[0]:
+                best = (rank, (gx, gy), math.hypot(gx - start[0], gy - start[1]) * self.grid.resolution)
         if best is not None:
             _, self.frontier_goal, self.frontier_best_distance = best
+            chosen_room = int(rooms[self.frontier_goal[1], self.frontier_goal[0]])
+            if chosen_room != active_room or not room_priority:
+                self.room_started = now
+            self.room_anchor = self.frontier_goal
             path = [self.frontier_goal]
             while path[-1] != start:
                 path.append(parents[path[-1]])
@@ -812,21 +913,24 @@ class MissionController:
             samples = []
             for offset in range(-half_window, half_window + 1):
                 value = float(ranges[(center + offset) % count])
-                if math.isfinite(value):
+                if not math.isnan(value) and value > .03:
                     samples.append(min(value, self.lidar_max))
             if not samples:
                 continue
             relative = math.pi - 2.0 * math.pi * center / count
             # Prefer open space, with a small bias against turning fully backward.
-            look_ahead = min(sum(samples) / len(samples) * 0.6, 1.0)
+            clearance = sum(samples) / len(samples)
+            look_ahead = min(clearance * 0.6, 1.0)
             gx, gy = self.grid.world_to_grid(
                 pose[0] + look_ahead * math.cos(pose[2] + relative),
                 pose[1] + look_ahead * math.sin(pose[2] + relative))
             visits = self.visit_counts[gy, gx] if self.grid.inside(gx, gy) else 100
-            score = sum(samples) / len(samples) - 0.12 * abs(relative) - 0.18 * visits
+            unseen = (self.grid.inside(gx, gy) and not self.camera_seen[gy, gx])
+            score = (clearance - 0.12 * abs(relative)
+                     - .3 * math.log1p(int(visits)) + .8 * unseen + .8 * (visits == 0))
             if score > best_score:
                 best_score, best_relative = score, relative
-                best_clearance = sum(samples) / len(samples)
+                best_clearance = clearance
         angle = pose[2] + best_relative
         distance = clamp(best_clearance * 0.45, 0.45, 1.0)
         return pose[0] + distance * math.cos(angle), pose[1] + distance * math.sin(angle)
@@ -840,7 +944,8 @@ class MissionController:
 
     def plan(self, pose, now):
         if self.state == self.EXPLORE:
-            pending = [track for track in self.apple_detector.confirmed if not track["visited"]]
+            pending = [track for track in getattr(self.apple_detector, 'identified', self.apple_detector.confirmed)
+                       if not track["visited"]]
             pending.sort(key=lambda track: math.hypot(track["x"] - pose[0], track["y"] - pose[1]))
             self.apple_goal = None
             self.path = []
@@ -861,7 +966,8 @@ class MissionController:
                     break
             if not self.path:
                 for candidate in getattr(self.apple_detector, 'tracks', []):
-                    if (candidate['confirmed'] or candidate['hits'] < 3
+                    if (candidate['confirmed'] or candidate.get('identified', False) or candidate.get('duplicate', False)
+                            or candidate['hits'] < 3
                             or candidate.get('yolo_hits', 0) < 1
                             or now - candidate['last_seen'] > 1.0
                             or now < candidate.get('retry_after', 0)):
@@ -991,21 +1097,7 @@ class MissionController:
         )
 
     def update_mission(self, pose, now):
-        """A fresh semantic close-up is required for each distinct target visit."""
-        for track in self.apple_detector.confirmed:
-            observation = track['observation']
-            if (not track['visited'] and now - track.get('last_yolo_seen', -10) < 0.6
-                    and observation['source'] == 'YOLO'
-                    and observation['distance_m'] < 0.55
-                    and math.hypot(pose[0] - track['x'], pose[1] - track['y']) < 0.55):
-                # Re-observing a previously visited apple must not finish the mission.
-                if any(math.hypot(track['x'] - old['x'], track['y'] - old['y']) < 0.75
-                       for old in self.apple_detector.visited):
-                    continue
-                track['visited'] = True
-                track['visited_at'] = now
-                self.path = []
-                print(f"[MISSION] Red apple approached ({len(self.apple_detector.visited)}/2).")
+        """Perception atomically counts a nearby confirmed apple as visited."""
         if self.state == self.EXPLORE and len(self.apple_detector.visited) >= 2:
             self.state = self.RETURN
             self.path = []
@@ -1072,8 +1164,9 @@ class MissionController:
         return True
 
     def proximity_escape(self, pose, ranges, now):
-        """Two short attempts to leave a soft safety margin, with fresh checks."""
-        blocked = self.control_reason in ('OBSTACLE_TOO_CLOSE', 'NO_SAFE_TRAJECTORY')
+        """Bound each escape, but never permanently lock out at one location."""
+        person_stop = self.control_reason == 'PERSON_TOO_CLOSE'
+        blocked = self.control_reason in ('OBSTACLE_TOO_CLOSE', 'NO_SAFE_TRAJECTORY', 'PERSON_TOO_CLOSE')
         if (not blocked or self.recovery.active or not self.estimator.localization_valid):
             if self.escape_started is not None:
                 self.path = []
@@ -1088,15 +1181,21 @@ class MissionController:
             self.escape_anchor = tuple(pose[:2])
             self.escape_attempts = 0
         if self.escape_started is not None:
-            if now - self.escape_started >= 1.5 or math.dist(pose[:2], self.escape_origin) >= .06:
+            if (now - self.escape_started >= (7.5 if person_stop else 4.0)
+                    or math.dist(pose[:2], self.escape_origin) >= (.30 if person_stop else .20)):
+                moved = math.dist(pose[:2], self.escape_origin)
+                print(f'[RECOVERY] Clearance attempt ended: localized progress={moved:.3f}m.')
                 self.escape_started = None
                 self.close_stop_since = now
                 self.path = []
                 self.last_plan_time = -10
+                self.motion_monitor.reset()
                 return None
-        elif self.escape_attempts >= 2:
+        elif self.escape_attempts >= 2 and now - self.close_stop_since < 5.0:
+            # Pause between retries; the old unconditional return latched forever.
             return None
-        command = clearance_escape(ranges, pose, self.people.tracks)
+        command = clearance_escape(ranges, pose, self.people.tracks,
+                                   curved=self.escape_attempts >= 1 and not person_stop)
         if command is not None and self.escape_started is None:
             self.escape_started = now
             self.escape_origin = tuple(pose[:2])
@@ -1104,23 +1203,6 @@ class MissionController:
             self.survey_remaining = 0
             print('[RECOVERY] Slowly increasing clearance from nearby obstacle.')
         return command
-
-    def detect_people(self):
-        camera = self.person_camera
-        if camera is None:
-            self.person_boxes = list(self.apple_detector.people_boxes)
-            return self.apple_detector.people_boxes, self.apple_detector.focal, self.apple_detector.width
-        width, height = camera.getWidth(), camera.getHeight()
-        raw = camera.getImage()
-        self.person_boxes = []
-        if raw:
-            bgr = np.frombuffer(raw, np.uint8).reshape(height, width, 4)[:, :, :3]
-            result = self.apple_detector.model.predict(source=bgr, classes=[0], conf=.20,
-                                                       imgsz=480, device='cpu', verbose=False)[0]
-            if result.boxes is not None:
-                self.person_boxes = [tuple(float(v) for v in b.xyxy[0].cpu().tolist())
-                                     for b in result.boxes]
-        return self.person_boxes, width / (2 * math.tan(camera.getFov() / 2)), width
 
     def survey_control(self, pose, now):
         """Bound the initial look-around even when rotation cannot make progress."""
@@ -1146,14 +1228,19 @@ class MissionController:
 
     def record_camera_coverage(self, pose):
         start = self.grid.world_to_grid(pose[0], pose[1])
+        # A small apple glimpsed at 2m is not a thorough inspection. Require a
+        # closer view and do not count floor below the camera's vertical field.
+        near = .073 * 2 * self.apple_detector.focal / self.camera.getHeight()
         for relative in np.linspace(-self.camera.getFov() / 2, self.camera.getFov() / 2, 45):
             angle = pose[2] + relative
-            end = self.grid.world_to_grid(pose[0] + 2 * math.cos(angle),
-                                          pose[1] + 2 * math.sin(angle))
+            end = self.grid.world_to_grid(pose[0] + 1.2 * math.cos(angle),
+                                          pose[1] + 1.2 * math.sin(angle))
             for gx, gy in bresenham(*start, *end):
                 if not self.grid.inside(gx, gy) or self.grid.log_odds[gy, gx] > -1:
                     break
-                self.camera_seen[gy, gx] = True
+                distance = math.hypot(gx - start[0], gy - start[1]) * self.grid.resolution
+                if distance >= near:
+                    self.camera_seen[gy, gx] = True
 
     def update_display(self, pose, now):
         if self.display is None or now - self.last_display_time < 0.5:
@@ -1167,7 +1254,7 @@ class MissionController:
                 draw_disc(image, cell, 1, (255, 120, 0))
             hx, hy = self.grid.world_to_grid(0.0, 0.0)
             draw_disc(image, (hx, hy), 4, (0, 210, 0))
-            for apple in self.apple_detector.confirmed:
+            for apple in self.apple_detector.identified:
                 ax, ay = self.grid.world_to_grid(apple["x"], apple["y"])
                 draw_disc(image, (ax, ay), 5, (0, 180, 0) if apple["visited"] else (255, 0, 0))
             rx, ry = self.grid.world_to_grid(pose[0], pose[1])
@@ -1201,6 +1288,7 @@ class MissionController:
                 (self.camera.getHeight(), self.camera.getWidth(), 4))[:, :, 2::-1].copy()
             height, width = frame.shape[:2]
             overlay_boxes = list(self.apple_detector.boxes)
+            overlay_boxes.extend(self.apple_detector.low_boxes)
             overlay_boxes.extend((*map(int, coords), 0.0, 'person')
                                  for coords in self.apple_detector.people_boxes)
             for x1, y1, x2, y2, confidence, source in overlay_boxes:
@@ -1209,6 +1297,8 @@ class MissionController:
                 color = (255, 40, 40) if source == "YOLO" else (255, 190, 0)
                 if source == 'person':
                     color = (0, 220, 255)
+                elif source not in ('YOLO', 'color'):
+                    color = (190, 80, 255)
                 frame[y1:y1 + 3, x1:x2] = color
                 frame[y2 - 3:y2, x1:x2] = color
                 frame[y1:y2, x1:x1 + 3] = color
@@ -1224,6 +1314,8 @@ class MissionController:
                 label = f"YOLO red apple {confidence:.2f}" if source == "YOLO" else "red candidate"
                 if source == 'person':
                     label = 'person - yield'
+                elif source not in ('YOLO', 'color'):
+                    label = source + ' - obstacle'
                 self.camera_display.drawText(label, x1, max(0, y1 - 22))
         except Exception as error:
             print(f"[CAMERA DISPLAY] {error}")
@@ -1247,8 +1339,9 @@ class MissionController:
                          "reason": self.recovery.last_reason},
             "control_reason": self.control_reason,
             "nearest_obstacle_m": getattr(self, 'nearest_obstacle_m', None),
-            "person_boxes": len(self.person_boxes),
+            "person_boxes": len(self.apple_detector.people_boxes),
             "tracked_people": len(self.people.tracks),
+            "low_obstacles": self.low_obstacles.active(self.robot.getTime()),
             "stop_reason": self.stop_reason,
             "survey_remaining_rad": round(self.survey_remaining, 3),
             "wheel_command_rad_s": self.last_wheels,
@@ -1296,7 +1389,13 @@ class MissionController:
                 if self.estimator.localization_valid:
                     self.last_localization_time = now
                 if sample is not None and not self.recovery.active:
-                    if abs(.5 * sum(self.last_wheels) * .033) > .025:
+                    if self.escape_started is not None:
+                        # Clearance escape has its own measured progress/timeout.
+                        # Ordinary recovery rejects the very soft margin we are
+                        # leaving and would latch into BLOCKED at this distance.
+                        self.motion_monitor.reset()
+                        stuck = False
+                    elif abs(.5 * sum(self.last_wheels) * .033) > .025:
                         stuck = self.motion_monitor.update(*sample)
                     else:
                         self.motion_monitor.reset()
@@ -1314,13 +1413,12 @@ class MissionController:
             camera_image = self.camera.getImage()
             inference_due = now - self.apple_detector.last_inference_time >= 0.25
             observations = self.apple_detector.detect(camera_image, pose, now)
-            if now - self.last_person_inference_time >= .5:
-                person_boxes, person_focal, person_width = self.detect_people()
-                self.dynamic_mask = self.people.update(
-                    person_boxes, person_focal, person_width, pose, ranges, now)
-                self.last_person_inference_time = now
             if inference_due:
+                self.dynamic_mask = self.people.update(
+                    self.apple_detector.people_boxes, self.apple_detector.focal,
+                    self.apple_detector.width, pose, ranges, now)
                 if self.estimator.localization_valid and not self.recovery.active and camera_image:
+                    self.low_obstacles.update(self.apple_detector.low_observations, now)
                     self.record_camera_coverage(pose)
             if not self.estimator.localization_valid or self.recovery.active:
                 observations = []
@@ -1337,13 +1435,18 @@ class MissionController:
             if self.camera_display is not None and inference_due:
                 self.update_camera_display(camera_image)
             for track in self.apple_detector.update_tracks(observations, now):
+                self.path = []
                 print(
-                    f"[PERCEPTION] Red apple confirmed at local "
+                    f"[MISSION] Red apple confirmed and visited "
+                    f"(apples={len(self.apple_detector.confirmed)}, visited={len(self.apple_detector.visited)}): "
                     f"({track['x']:.2f}, {track['y']:.2f}) m; {track['observation']}"
                 )
 
             if scan_updated and self.estimator.localization_valid and not self.recovery.active:
                 self.update_mission(pose, now)
+            # Only downstream action uses virtual floor-obstacle returns.
+            # Pose estimation and mapping above always use the real LiDAR scan.
+            ranges = self.low_obstacles.control_ranges(ranges, pose, now)
             home_distance = math.hypot(pose[0], pose[1])
             if self.state == self.COMPLETE:
                 self.set_wheels(0.0, 0.0, emergency=True)
@@ -1357,7 +1460,8 @@ class MissionController:
                     self.update_display(pose, self.robot.getTime())
                 return
 
-            if self.path and self.path_index < len(self.path) and now - self.last_plan_time >= .5:
+            if self.path and self.path_index < len(self.path) and now - self.last_path_check_time >= .5:
+                self.last_path_check_time = now
                 current = self.grid.world_to_grid(pose[0], pose[1])
                 if not self.grid.line_is_free(current, self.path[self.path_index], self.navigation_obstacles()):
                     self.path = []

@@ -960,14 +960,6 @@ TurtleBot3Burger {
       width 640
       height 480
     }
-    Camera {
-      translation 0.05 0 0.07
-      rotation 0 1 0 -0.18
-      name "camera_people"
-      fieldOfView 1.25
-      width 320
-      height 480
-    }
     RobotisLds01 {
     }
   ]

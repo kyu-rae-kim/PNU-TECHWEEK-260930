@@ -56,6 +56,7 @@ class AppleDetectionTests(unittest.TestCase):
             self.assertEqual(len(observations), 1)
             detector.update_tracks(observations, time)
         self.assertEqual(len(detector.confirmed), 1)
+        self.assertEqual(len(detector.visited), 1)
         self.assertEqual(detector.boxes[0][-1], "YOLO")
         self.assertEqual(detector.boxes[0][:4], (30, 70, 50, 90))
 
@@ -100,6 +101,24 @@ class AppleDetectionTests(unittest.TestCase):
         for now in (0, 2, 4, 6):
             detector.update_tracks([obs], now)
         self.assertFalse(detector.confirmed)
+
+    def test_distant_apple_is_an_approach_goal_then_both_counts_increment(self):
+        detector = RedAppleDetector.__new__(RedAppleDetector)
+        detector.tracks = []
+        def observe(distance, now, source='YOLO'):
+            return detector.update_tracks([(2, 0, .9, 0, distance, 80, 85, 8, .9, .9, source)], now)
+        for now in (0, .3, .6):
+            observe(1.5, now)
+        self.assertEqual(len(detector.identified), 1)
+        self.assertEqual(len(detector.confirmed), 0)
+        self.assertEqual(len(detector.visited), 0)
+        observe(.7, .9, 'color')
+        self.assertEqual(len(detector.visited), 0)
+        self.assertEqual(len(observe(.7, 1.2)), 1)
+        self.assertEqual(len(detector.confirmed), 1)
+        self.assertEqual(len(detector.visited), 1)
+        self.assertEqual(observe(.6, 1.5), [])
+        self.assertEqual(len(detector.visited), 1)
 
 
 if __name__ == "__main__":

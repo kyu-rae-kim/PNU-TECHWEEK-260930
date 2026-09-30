@@ -84,26 +84,30 @@ class SafetyTests(unittest.TestCase):
         return dict(x=x, y=0, confirmed=True, visited=False, last_yolo_seen=now,
                     observation=dict(source=source, distance_m=.4))
 
-    def test_two_distinct_close_ups_then_home(self):
+    def test_two_nearby_confirmations_increment_both_counts_then_return(self):
         mission = self.mission()
-        a, b = self.apple(1), self.apple(3)
-        mission.apple_detector.tracks = [a, b]
-        mission.update_mission((.6, 0, 0), 1)
-        self.assertTrue(a['visited'])
-        self.assertEqual(mission.state, mission.EXPLORE)
-        mission.update_mission((2.6, 0, 0), 1)
+        detector = mission.apple_detector
+        for x, start in ((1, 0), (3, 2)):
+            for offset in (0, .3, .6):
+                obs = (x, 0, .9, 0, .7, 80, 85, 8, .9, .9, 'YOLO')
+                detector.update_tracks([obs], start + offset)
+            self.assertEqual(len(detector.confirmed), len(detector.visited))
+        mission.update_mission((2.3, 0, 0), 2.6)
+        self.assertEqual(len(detector.visited), 2)
         self.assertEqual(mission.state, mission.RETURN)
-        mission.update_mission((.1, 0, 0), 2)
+        mission.update_mission((.1, 0, 0), 3)
         self.assertEqual(mission.state, mission.COMPLETE)
 
-    def test_duplicate_color_and_stale_observations_do_not_finish(self):
+    def test_duplicate_and_color_observations_do_not_increment_counts(self):
         mission = self.mission()
-        a, duplicate = self.apple(1), self.apple(1.3)
-        color, stale = self.apple(3, source='color'), self.apple(5, now=0)
-        mission.apple_detector.tracks = [a, duplicate, color, stale]
-        for x in (.6, 1, 2.6, 4.6):
-            mission.update_mission((x, 0, 0), 1)
-        self.assertEqual(len(mission.apple_detector.visited), 1)
+        detector = mission.apple_detector
+        for x, source, start in ((1, 'YOLO', 0), (1.6, 'YOLO', 2), (3, 'color', 4)):
+            for offset in (0, .3, .6):
+                obs = (x, 0, .9, 0, .6, 80, 85, 8, .9, .9, source)
+                detector.update_tracks([obs], start + offset)
+        mission.update_mission((0, 0, 0), 5)
+        self.assertEqual(len(detector.confirmed), 1)
+        self.assertEqual(len(detector.visited), 1)
         self.assertEqual(mission.state, mission.EXPLORE)
 
     def test_emergency_stop_bypasses_acceleration_limit(self):
@@ -219,19 +223,27 @@ class SafetyTests(unittest.TestCase):
         mission = self.survey_mission()
         self.assertTrue(mission.request_survey((1.1, 0, 0), 33))
 
-    def test_person_camera_detections_reach_lidar_tracker(self):
+    def test_existing_camera_detects_person_without_counting_an_apple(self):
         mission = self.mission()
-        mission.person_camera = types.SimpleNamespace(getWidth=lambda: 160, getHeight=lambda: 120,
-            getFov=lambda: math.pi / 3, getImage=lambda: bytes(160 * 120 * 4))
+        detector = mission.apple_detector
+        detector.width, detector.height = 160, 120
+        detector.focal = 160 / (2 * math.tan(math.pi / 6))
+        detector.last_inference_time = -10
         calls = []
         def predict(**kwargs):
             calls.append(kwargs['classes'])
-            return [types.SimpleNamespace(boxes=[types.SimpleNamespace(xyxy=[
-                types.SimpleNamespace(cpu=lambda: types.SimpleNamespace(tolist=lambda: [60, 10, 100, 115]))])])]
-        mission.apple_detector.model = types.SimpleNamespace(predict=predict)
-        boxes, focal, width = mission.detect_people()
-        mask = mission.people.update(boxes, focal, width, (0, 0, 0), [1.] * 360, 1)
-        self.assertEqual(calls, [[0]])
+            box = types.SimpleNamespace(
+                cls=[types.SimpleNamespace(cpu=lambda: 0)],
+                xyxy=[types.SimpleNamespace(cpu=lambda: types.SimpleNamespace(
+                    tolist=lambda: [60, 10, 100, 115]))])
+            return [types.SimpleNamespace(boxes=[box])]
+        detector.model = types.SimpleNamespace(predict=predict)
+        observations = detector.detect(bytes(160 * 120 * 4), (0, 0, 0), 1)
+        mask = mission.people.update(detector.people_boxes, detector.focal,
+                                     detector.width, (0, 0, 0), [1.] * 360, 1)
+        self.assertIn(0, calls[0])
+        self.assertIn(47, calls[0])
+        self.assertEqual(observations, [])
         self.assertEqual(len(mission.people.tracks), 1)
         self.assertTrue(mask[180])
 

@@ -9,11 +9,11 @@ def angle(a):
     return (a + math.pi) % (2 * math.pi) - math.pi
 
 
-def clearance_escape(ranges, pose, people):
-    """Slow straight retreat/advance only when every nearby return moves away.
+def clearance_escape(ranges, pose, people, curved=False):
+    """Slow escape only when every nearby return moves away.
 
     This handles the stop-threshold deadlock; never authorizes motion inside the
-    15cm hard footprint or toward a person. Validate the next two seconds anew
+    15cm hard footprint or toward a close person. Validate the next two seconds anew
     on every control step.
     """
     values = np.asarray(ranges, dtype=float)
@@ -27,28 +27,46 @@ def clearance_escape(ranges, pose, people):
     if initial.min() < .15:
         return None
     near = initial < .25
-    if not np.any(near):
+    person_initial = np.array([math.hypot(p['x'] - pose[0], p['y'] - pose[1]) for p in people])
+    person_near = person_initial < .7
+    if np.any(person_initial < .35):
+        return None
+    if not np.any(near) and not np.any(person_near):
         return None
     best = None
-    for velocity in (-.04, .04):
+    candidates = [(v, 0.) for v in (-.04, .04)]
+    if curved:
+        candidates = [(v, w) for v in (-.06, .06) for w in (-.45, .45)] + candidates
+    for velocity, omega in candidates:
         previous = initial
+        person_previous = person_initial
         safe = True
         for elapsed in np.linspace(.1, 2., 20):
-            distances = np.linalg.norm(points - [velocity * elapsed, 0], axis=1)
+            cx = velocity * math.sin(omega * elapsed) / omega if omega else velocity * elapsed
+            cy = velocity * (1 - math.cos(omega * elapsed)) / omega if omega else 0.
+            distances = np.linalg.norm(points - [cx, cy], axis=1)
             if distances.min() < .15 or np.any(distances[near] < previous[near] - .00001):
                 safe = False
                 break
-            wx = pose[0] + velocity * elapsed * math.cos(pose[2])
-            wy = pose[1] + velocity * elapsed * math.sin(pose[2])
-            if any(math.hypot(p['x'] + p['vx'] * elapsed - wx,
-                              p['y'] + p['vy'] * elapsed - wy) < .7 for p in people):
+            wx = pose[0] + cx * math.cos(pose[2]) - cy * math.sin(pose[2])
+            wy = pose[1] + cx * math.sin(pose[2]) + cy * math.cos(pose[2])
+            person_distances = np.array([math.hypot(p['x'] + p['vx'] * elapsed - wx,
+                                                  p['y'] + p['vy'] * elapsed - wy) for p in people])
+            # Inside the soft margin, allow only a retreat that increases every
+            # close person's predicted distance; never approach to regain a path.
+            if (np.any(person_distances < .35)
+                    or np.any(person_distances[~person_near] < .7)
+                    or np.any(person_distances[person_near] <= person_previous[person_near] + .00001)):
                 safe = False
                 break
             previous = distances
-        gain = float(previous.min() - initial.min())
+            person_previous = person_distances
+        gain = (float(np.min(person_previous[person_near] - person_initial[person_near]))
+                if np.any(person_near) else float(previous.min() - initial.min()))
         if safe and gain > .01 and (best is None or gain > best[0]):
-            best = gain, velocity
-    return None if best is None else (best[1] / .033, best[1] / .033)
+            best = gain, velocity, omega
+    return None if best is None else ((best[1] - .080 * best[2]) / .033,
+                                      (best[1] + .080 * best[2]) / .033)
 
 
 def scan_points(ranges, max_range):
