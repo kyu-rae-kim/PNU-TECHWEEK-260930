@@ -942,12 +942,30 @@ Cabinet {
 TurtleBot3Burger {
   translation -0.3 -7.5 0
   rotation 0 0 1 3.14159
-  controller "tb3_teleop"
+  controller "tb3_rescue"
   extensionSlot [
+    Display {
+      name "YOLO camera"
+      width 640
+      height 480
+    }
+    Display {
+      name "display"
+      width 360
+      height 360
+    }
     Camera {
       translation 0.05 0 -0.08
       fieldOfView 1.0472
       width 640
+      height 480
+    }
+    Camera {
+      translation 0.05 0 0.07
+      rotation 0 1 0 -0.18
+      name "camera_people"
+      fieldOfView 1.25
+      width 320
       height 480
     }
     RobotisLds01 {

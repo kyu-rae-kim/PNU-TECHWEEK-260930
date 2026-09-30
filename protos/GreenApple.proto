@@ -18,7 +18,7 @@ PROTO GreenApple [
   Solid {
     translation IS translation
     rotation IS rotation
-    recognitionColors [ 0.59 0.75 0.28 ]
+    recognitionColors [ 0.2 0.8 0.2 ]
     children [
       Transform {
         scale %<= fields.scale.value >% %<= fields.scale.value >% %<= fields.scale.value >%
@@ -27,9 +27,7 @@ PROTO GreenApple [
             appearance PBRAppearance {
               metalness 0
               roughness 0.4
-              baseColorMap ImageTexture {
-                url "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/fruits/protos/textures/apple.jpg"
-	      }
+              baseColor 0.2 0.8 0.2
             }
             geometry IndexedFaceSet {
               coord Coordinate {

@@ -18,7 +18,7 @@ PROTO RedApple [
   Solid {
     translation IS translation
     rotation IS rotation
-    recognitionColors [ 0.59 0.75 0.28 ]
+    recognitionColors [ 1 0 0 ]
     children [
       Transform {
         scale %<= fields.scale.value >% %<= fields.scale.value >% %<= fields.scale.value >%
